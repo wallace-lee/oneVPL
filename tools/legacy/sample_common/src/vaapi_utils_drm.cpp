@@ -398,7 +398,7 @@ bool drmRenderer::setupConnection(drmModeRes* resource, drmModeConnector* connec
     }
 
     // we will use the first available mode - that's always mode with the highest resolution
-    m_mode = connector->modes[0];
+    m_mode = connector->modes[1]; // not true, the first available mode for the LG 8K TV we have is not the highest resolution
 
     edidBlobId = getConnectorPropertyValue("EDID");
     edidBlob   = m_drmlib.drmModeGetPropertyBlob(m_fd, edidBlobId);
@@ -601,6 +601,7 @@ int drmRenderer::drmSendHdrMetaData(mfxExtMasteringDisplayColourVolume* displayC
                                     mfxExtContentLightLevelInfo* contentLight,
                                     bool enableHDR) {
     #if defined(DRM_LINUX_HDR_SUPPORT)
+    msdk_printf(MSDK_STRING("DRM_LINUX_HDR_SUPPORT:trueim enableHdr: %d\n"), enableHDR);
     int ret;
     uint32_t propertyHdrId = getConnectorPropertyId("HDR_OUTPUT_METADATA");
     memset(&m_hdrMetaData.data.hdmi_metadata_type1,
@@ -621,10 +622,17 @@ int drmRenderer::drmSendHdrMetaData(mfxExtMasteringDisplayColourVolume* displayC
     }
 
     if (enableHDR) {
+       msdk_printf(MSDK_STRING("drmSendHdrMetaData: true\n"));
+
+    } else {
+       msdk_printf(MSDK_STRING("drmSendHdrMetaData: false\n"));
+    }
+
+    if (enableHDR) {
         m_hdrMetaData.data.metadata_type            = DRM_STATIC_METADATA_TYPE1;
         m_hdrMetaData.data.hdmi_metadata_type1.eotf = DRM_METADATA_EOTF_SMPTE_2084;
         if (m_hdrMetaData.data.hdmi_metadata_type1.eotf) {
-            if (displayColor->InsertPayloadToggle == MFX_PAYLOAD_IDR) {
+            if (displayColor && displayColor->InsertPayloadToggle == MFX_PAYLOAD_IDR) {
                 m_hdrMetaData.data.hdmi_metadata_type1.display_primaries[0].x =
                     displayColor->DisplayPrimariesX[0];
                 m_hdrMetaData.data.hdmi_metadata_type1.display_primaries[0].y =
@@ -640,7 +648,7 @@ int drmRenderer::drmSendHdrMetaData(mfxExtMasteringDisplayColourVolume* displayC
                 m_hdrMetaData.data.hdmi_metadata_type1.white_point.x = displayColor->WhitePointX;
                 m_hdrMetaData.data.hdmi_metadata_type1.white_point.y = displayColor->WhitePointY;
             }
-            if (contentLight->InsertPayloadToggle == MFX_PAYLOAD_IDR) {
+            if (contentLight && contentLight->InsertPayloadToggle == MFX_PAYLOAD_IDR) {
                 m_hdrMetaData.data.hdmi_metadata_type1.min_display_mastering_luminance =
                     displayColor->MinDisplayMasteringLuminance;
                 m_hdrMetaData.data.hdmi_metadata_type1.max_display_mastering_luminance =
@@ -821,6 +829,58 @@ mfxStatus drmRenderer::render(mfxFrameSurface1* pSurface) {
     if (!setMaster()) {
         return MFX_ERR_UNKNOWN;
     }
+
+    //debug use only
+    //msdk_printf(MSDK_STRING("drmRender. hdisply: %d, width: %d, vdisply: %d, height: %d, MFXVer: %d.\n"), 
+    //		m_mode.hdisplay, 
+    //		memid->m_image.width, 
+    //		m_mode.vdisplay, 
+    //		memid->m_image.height, 
+    //		MFX_VERSION);
+
+    // to support direct panel tonemap for 8K@60 HDR playback via CH7218 connected
+    // to 8K HDR panel.
+    // This code is needed not only for rendering to overlay plane
+    #if (MFX_VERSION >= 2006)
+        mfxExtMasteringDisplayColourVolume* displayColor =
+            (mfxExtMasteringDisplayColourVolume*)GetExtBuffer(
+                pSurface->Data.ExtParam,
+                pSurface->Data.NumExtParam,
+                MFX_EXTBUFF_MASTERING_DISPLAY_COLOUR_VOLUME);
+        mfxExtContentLightLevelInfo* contentLight =
+            (mfxExtContentLightLevelInfo*)GetExtBuffer(pSurface->Data.ExtParam,
+                                                       pSurface->Data.NumExtParam,
+                                                       MFX_EXTBUFF_CONTENT_LIGHT_LEVEL_INFO);
+
+	  msdk_printf(MSDK_STRING("MFX_VERSION: %d, m_bSendHDR: %d, m_bHdrSupport: %d, color: %p, light: %p\n"), 
+			MFX_VERSION, 
+			m_bSentHDR, 
+			m_bHdrSupport, 
+			displayColor, 
+			contentLight);
+
+        if (!m_bSentHDR && m_bHdrSupport /* && (displayColor && contentLight) */) {
+            msdk_printf(MSDK_STRING("MFX_VERSION: %d, m_bSendHDR: %d, m_bHdrSupport: %d\n"), MFX_VERSION, m_bSentHDR, m_bHdrSupport);
+
+            msdk_printf(MSDK_STRING("%d, displayColor: %d, contentLight: %d.\n"), 
+			(displayColor) ? displayColor->InsertPayloadToggle : -1, 
+			(contentLight) ? contentLight->InsertPayloadToggle : -1, 
+			MFX_PAYLOAD_IDR
+	    );
+    	    //if (displayColor->InsertPayloadToggle == MFX_PAYLOAD_IDR ||
+            //    contentLight->InsertPayloadToggle == MFX_PAYLOAD_IDR) 
+            {
+                // both panel and bitstream have HDR support
+                msdk_printf(MSDK_STRING("both panel and bitstream have HDR support.\n"));
+		// TODO: what is the correct condition to set drmSetColorSpace(true) ?
+	        bool setcs = (displayColor && contentLight) && (displayColor->InsertPayloadToggle && contentLight->InsertPayloadToggle);
+ 	        if (drmSetColorSpace(setcs) || drmSendHdrMetaData(displayColor, contentLight, true))
+                    return MFX_ERR_UNKNOWN;
+            }
+                m_bSentHDR = true;
+      }
+    #endif
+
     if ((m_mode.hdisplay == memid->m_image.width) && (m_mode.vdisplay == memid->m_image.height)) {
         // surface in the framebuffer exactly matches crtc scanout port, so we
         // can scanout from this framebuffer for the whole crtc
@@ -834,29 +894,7 @@ mfxStatus drmRenderer::render(mfxFrameSurface1* pSurface) {
             m_overlay_wrn = false;
             msdk_printf(MSDK_STRING("drmrender: warning: rendering via OVERLAY plane\n"));
         }
-    // to support direct panel tonemap for 8K@60 HDR playback via CH7218 connected
-    // to 8K HDR panel.
-    #if (MFX_VERSION >= 2006)
-        mfxExtMasteringDisplayColourVolume* displayColor =
-            (mfxExtMasteringDisplayColourVolume*)GetExtBuffer(
-                pSurface->Data.ExtParam,
-                pSurface->Data.NumExtParam,
-                MFX_EXTBUFF_MASTERING_DISPLAY_COLOUR_VOLUME);
-        mfxExtContentLightLevelInfo* contentLight =
-            (mfxExtContentLightLevelInfo*)GetExtBuffer(pSurface->Data.ExtParam,
-                                                       pSurface->Data.NumExtParam,
-                                                       MFX_EXTBUFF_CONTENT_LIGHT_LEVEL_INFO);
-
-        if (!m_bSentHDR && m_bHdrSupport && (displayColor && contentLight)) {
-            if (displayColor->InsertPayloadToggle == MFX_PAYLOAD_IDR ||
-                contentLight->InsertPayloadToggle == MFX_PAYLOAD_IDR) {
-                // both panel and bitstream have HDR support
-                if (drmSetColorSpace(true) || drmSendHdrMetaData(displayColor, contentLight, true))
-                    return MFX_ERR_UNKNOWN;
-            }
-            m_bSentHDR = true;
-        }
-    #endif
+  
         // surface in the framebuffer exactly does NOT match crtc scanout port,
         // and we can only use overlay technique with possible resize (depending on the driver))
         ret = m_drmlib.drmModeSetPlane(m_fd,
@@ -877,7 +915,6 @@ mfxStatus drmRenderer::render(mfxFrameSurface1* pSurface) {
         }
     }
     dropMaster();
-
     /* Unlock previous Render Target Surface (if exists) */
     if (NULL != m_pCurrentRenderTargetSurface)
         msdk_atomic_dec16((volatile mfxU16*)&m_pCurrentRenderTargetSurface->Data.Locked);
